@@ -1,6 +1,9 @@
 from __future__ import unicode_literals
+import asyncio
 from typing import *
+import os
 from yt_dlp import YoutubeDL
+from yt_dlp.extractor.neteasemusic import NetEaseMusicBaseIE
 
 import errors
 import utils
@@ -12,19 +15,27 @@ from zeta_bot import (
 
 console = console.Console()
 
+NETEASE_COOKIE_FILE = "./configs/netease-cookies.txt"
+NetEaseMusicBaseIE._API_BASE = "https://music.163.com/api/"
+
 level = "YT-DLP模块"
 
 async def get_info(ytb_url):
     ydl_opts = {
-        'format': 'bestaudio/best',
+        'format': 'exhigh/higher/standard/bestaudio/best',
         'extract_flat': True,
         "quiet": True,
     }
+    if os.path.exists(NETEASE_COOKIE_FILE):
+        ydl_opts["cookiefile"] = NETEASE_COOKIE_FILE
 
     await console.rp(f"开始提取信息：{ytb_url}", f"[{level}]")
 
-    with YoutubeDL(ydl_opts) as ydl:
-        info_dict = ydl.extract_info(ytb_url, download=False)
+    def _extract_info():
+        with YoutubeDL(ydl_opts) as ydl:
+            return ydl.extract_info(ytb_url, download=False)
+
+    info_dict = await asyncio.to_thread(_extract_info)
 
     video_id = info_dict["id"]
     video_title = info_dict["title"]
@@ -55,16 +66,21 @@ async def audio_download(youtube_url, info_dict, download_path, download_type="y
     video_path = f"{download_path}/{video_path_title}.{video_name_extension}"
 
     ydl_opts = {
-        "format": "bestaudio/best",
+        "format": "exhigh/higher/standard/bestaudio/best",
         "outtmpl": video_path,
         "extract_flat": True,
         "quiet": True,
     }
+    if os.path.exists(NETEASE_COOKIE_FILE):
+        ydl_opts["cookiefile"] = NETEASE_COOKIE_FILE
 
     await console.rp(f"开始下载：{video_path_title}.{video_name_extension}", f"[{level}]")
 
-    with YoutubeDL(ydl_opts) as ydl:
-        ydl.download([youtube_url])
+    def _download_audio():
+        with YoutubeDL(ydl_opts) as ydl:
+            ydl.download([youtube_url])
+
+    await asyncio.to_thread(_download_audio)
 
     new_audio = audio.Audio(video_title, download_type, video_id, video_path, video_duration)
 
@@ -96,20 +112,28 @@ async def youtube_search(query, query_num=5) -> list:
     query = query.strip()
 
     ydl_opts = {
-        'format': 'bestaudio/best',
+        'format': 'exhigh/higher/standard/bestaudio/best',
         'outtmpl': "./downloads/" + '/%(title)s.%(ext)s',
         'default_search': "ytsearch",
         'extract_flat': True,
         "quiet": True,
     }
+    if os.path.exists(NETEASE_COOKIE_FILE):
+        ydl_opts["cookiefile"] = NETEASE_COOKIE_FILE
 
     if query == "":
         return []
 
     await console.rp(f"开始搜索：{query}", f"[{level}]")
 
-    with YoutubeDL(ydl_opts) as ydl:
-        extracted_info = ydl.extract_info(f"ytsearch{query_num}:{query}", download=False)
+    def _search_audio():
+        with YoutubeDL(ydl_opts) as ydl:
+            return ydl.extract_info(
+                f"ytsearch{query_num}:{query}",
+                download=False,
+            )
+
+    extracted_info = await asyncio.to_thread(_search_audio)
 
     result = []
     log_message = f"搜索 {query} 结果为："

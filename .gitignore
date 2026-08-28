@@ -25,3 +25,17 @@ log/
 logs/
 config/
 configs/
+
+# local secrets/runtime - never push
+configs/
+downloads/
+logs/
+data/
+__pycache__/
+*.pyc
+*.bak-*
+*.before-*
+*.backup-*
+*.tar.gz
+*.log
+.venv/

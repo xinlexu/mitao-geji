@@ -96,6 +96,7 @@ from zeta_bot import (
     playlist,
 )
 from zeta_bot.help import HelpMenu
+from zeta_bot import lavalink_backend
 
 print(f"\nZeta-Bot程序启动\n{logo}\n\n{version_header}\n")
 
@@ -250,6 +251,21 @@ async def on_ready():
     # 初始化主音频库
     await audio_lib_main.initialize()
 
+    # ZETA_LAVALINK_BACKEND_INIT_V1
+    try:
+        await lavalink_backend.initialize(bot)
+        await console.rp(
+            f"Lavalink音频后端已就绪（{lavalink_backend.BACKEND_VERSION}）",
+            "[系统]",
+        )
+    except Exception as error:
+        await console.rp(
+            f"Lavalink音频后端初始化失败：{error!r}",
+            "[系统]",
+            message_type=utils.PrintType.ERROR,
+            print_head=True,
+        )
+
     # 设置机器人状态
     bot_activity_type = discord.ActivityType.playing
     await bot.change_presence(
@@ -332,6 +348,7 @@ async def auto_reboot():
             voice_client = current_guild.voice_client
             if voice_client is not None:
                 await current_guild.text_channels[0].send(f"{current_time} 开始执行自动定时重启")
+    await lavalink_backend.shutdown(bot)
     os.execl(python_path, python_path, * sys.argv)
 
 
@@ -1048,7 +1065,9 @@ async def join_callback(ctx: discord.ApplicationContext, channel: discord.VoiceC
 
     # 机器人未在任何语音频道的情况
     if voice_client is None:
-        await channel.connect()
+        await channel.connect(
+            cls=lavalink_backend.LavalinkVoiceClient,
+        )
         if command_call:
             await embed_respond(ctx, author_name=f"已加入语音频道：->  {channel.name}", author_icon_url=icon.url(icon_filename), files=icon_lib.files(icon_filename))
 
@@ -1080,10 +1099,8 @@ async def leave_callback(ctx: discord.ApplicationContext) -> None:
     icon_filename = "logout_hover_pinch_animated_0ms_100px.gif"
 
     if voice_client is not None:
-        # 防止因退出频道自动删除正在播放的音频
-        if len(current_playlist) > 0:
-            current_audio = current_playlist.get_audio(0)
-            current_playlist.insert_audio(current_audio, 0)
+        # ZETA_LAVALINK_LEAVE_PRESERVE_QUEUE_V1
+        # The existing queue is preserved without inserting a duplicate.
 
         last_channel = voice_client.channel
         await voice_client.disconnect(force=False)
@@ -1279,15 +1296,29 @@ async def play_audio(ctx: discord.ApplicationContext, target_audio: audio.Audio,
     current_guild = guild_lib.get_guild(ctx)
     audio_lib_main.lock_audio(f"{ctx.guild.id}_NOW_PLAYING", target_audio)
 
-    voice_client.play(
-        discord.PCMVolumeTransformer(
-            discord.FFmpegPCMAudio(
-                executable=ffmpeg_path, source=target_audio.get_path()
-            )
-        ),
-        after=lambda e: asyncio.run_coroutine_threadsafe(play_next(ctx), bot.loop)
-    )
-    voice_client.source.volume = current_guild.get_voice_volume() / 100.0
+    # ZETA_LAVALINK_PLAYBACK_V1
+    if not isinstance(voice_client, lavalink_backend.LavalinkVoiceClient):
+        audio_lib_main.unlock_audio(
+            f"{ctx.guild.id}_NOW_PLAYING",
+            target_audio,
+        )
+        raise RuntimeError(
+            "当前语音连接不是Lavalink后端，请先让机器人离开语音频道后重新加入"
+        )
+
+    try:
+        await voice_client.play_zeta_audio(
+            target_audio,
+            ctx=ctx,
+            after=play_next,
+            volume_percent=current_guild.get_voice_volume(),
+        )
+    except Exception:
+        audio_lib_main.unlock_audio(
+            f"{ctx.guild.id}_NOW_PLAYING",
+            target_audio,
+        )
+        raise
 
     await console.rp(f"开始播放：{target_audio.get_path()} 时长：{target_audio.get_duration_str()}", ctx.guild)
     playing_icon_filename = "vinyl_loop_playing_animated_infinite_100px.gif"
@@ -2354,6 +2385,7 @@ async def reboot_callback(ctx):
     icon_filename = "spin_in_reveal_0ms_100px.gif"
     await embed_respond(ctx, author_name="正在重启", colour=red, author_icon_url=icon.url(icon_filename), files=icon_lib.files(icon_filename))
 
+    await lavalink_backend.shutdown(bot)
     os.execl(python_path, python_path, * sys.argv)
 
 
@@ -2365,6 +2397,7 @@ async def shutdown_callback(ctx):
 
     icon_filename = "logout_hover_pinch_red_animated_0ms_100px.gif"
     await embed_respond(ctx, author_name="正在关闭", colour=red, author_icon_url=icon.url(icon_filename), files=icon_lib.files(icon_filename))
+    await lavalink_backend.shutdown(bot)
     await bot.close()
 
 
