@@ -1,103 +1,35 @@
-# Zeta Discord 机器人
-一个基于Pycord的Discord机器人  
-作者目前业余编程，如有不规范的地方请多多包涵与指教  
+# 🍑 蜜桃歌姬
 
-目前机器人只有中文可用  
-The display language currently available for this robot is Chinese only.  
+「蜜桃成熟了」服务器的专属 Discord 音乐机器人。
 
-目录 Table of contents
-------------------------
-- [核心功能](#核心功能)
-- [如何安装并部署](#如何安装并部署)
-- [Core Features](#core-features)
-- [How to install and deploy](#how-to-install-and-deploy)
+## 功能
 
-## 核心功能
-- 在Discord音频频道中播放来自哔哩哔哩视频的声音
-- 在Discord音频频道中播放来自YouTube视频的声音
-- 在Discord音频频道中播放来自网易云音乐的音频
-- 直接在Discord频道内进行哔哩哔哩或YouTube搜索并播放
-- 可交互的播放列表
+- 网易云音乐：单曲 / 歌单，会员完整音质（不是 30 秒试听）
+- 哔哩哔哩、YouTube 播放与站内搜索
+- 可交互播放列表面板 + 中文 Slash 指令
 
-## 如何安装并部署
-**请使用Python 3.10-3.13版本**
+## 常用指令
 
-请从release中下载最新版本源码解压
-  
-将命令行运行目录移动至解压后的源码根目录后使用以下指令来安装依赖包：  
-```
- pip install -r requirements.txt
-```
+`/加入语音频道` · `/播放 链接或关键词` · `/音量` · `/播放列表` · `/清空播放列表`
 
-如果需要使用机器人的YouTube相关功能推荐为`yt-dlp-ejs`启用JavaScript运行环境。
-`yt-dlp-ejs`已经包含在了`requirements.txt`的`yt-dlp[default]`中，会在安装依赖包时自动安装。环境的选择与安装可以参考此页面中的Step 1：https://github.com/yt-dlp/yt-dlp/wiki/EJS#step-1-install-a-supported-javascript-runtime
-  
-Windows系统请前往[FFmpeg官网](https://ffmpeg.org/download.html)获取ffmpeg.exe  
-（或使用 https://www.gyan.dev/ffmpeg/builds/ffmpeg-git-full.7z 下载后解压bin文件夹内的ffmpeg.exe）  
-  
-Linux系统可使用库内bin文件夹内自带的ffmpeg或前往[FFmpeg官网](https://ffmpeg.org/download.html)获取最新版ffmpeg  
+## 架构
 
-将解压出的ffmpeg文件放入库中的bin文件夹内  
+- 歌曲解析与下载：yt-dlp（网易云会员 Cookie，本地缓存）
+- 语音发送与 DAVE(E2EE) 加密：Lavalink 4.2.2（koe / libdave），独立 systemd 服务
+- 机器人本体：Python / Pycord，对接层 `zeta_bot/lavalink_backend.py`
 
-Linux系统还需要安装：  
-```
-sudo apt install libopus0
-```
+## 运维速查（服务器上执行）
 
-输入以下命令以运行机器人：  
-```
-python main.py
-```
+- 服务状态：`systemctl status zeta-bot zeta-lavalink`
+- 实时日志：`journalctl -u zeta-bot -f -o cat`
+- 重启机器人：`systemctl restart zeta-bot`
+- 备份代码到本仓库：`bash /root/backup-to-github.sh`
+- 详见《蜜桃歌姬-维护手册.md》与 migration/ 目录
 
-根据提示完成设置，保持窗口打开以确保机器人正常运行  
-如需更改设置，则使用以下命令启动机器人（0.7.0及更高版本）：
-```
-python main.py --mode=setting
-```  
+## 更新日志
 
-# Zeta Discord Bot
-A Discord Bot that is based on Pycord.
+- 2026-08-28 语音后端迁移至 Lavalink：根治长播无声；修复切歌即停与中文文件名加载
+- 2026-08-04 网易云会员完整歌曲打通（Cookie + HTTPS 修复 + 异步下载）
 
-## Core Features
-- Play Bilibili's video sound on the Discord Voice Channels
-- Play YouTube's video sound on the Discord Voice Channels
-- Play NetEase CloudMusic's audio on the Discord Voice Channels
-- Search and play directly within the Discord channel
-- Interactive playlists
-
-## How to install and deploy
-**Please use Python 3.10 - 3.13**
-  
-Please download the latest version of the source code from the release page and unzip it.
-
-Change the command line working directory to the root directory and use the following command to install dependencies:
-```
- pip install -r requirements.txt
-```
-
-If you need to use the bot's YouTube-related features, you should enabling the JavaScript runtime for `yt-dlp-ejs`.
-`yt-dlp-ejs` is already included in `yt-dlp[default]` in the `requirements.txt` and will be installed automatically when you install the dependencies. For information on selecting and setting up the environment, refer to Step 1 on this page: https://github.com/yt-dlp/yt-dlp/wiki/EJS#step-1-install-a-supported-javascript-runtime
-  
-Windows: please visit [FFmpeg](https://ffmpeg.org/download.html) to get ffmpeg.exe
-(or access https://www.gyan.dev/ffmpeg/builds/ffmpeg-git-full.7z download and unzip it to get ffmpeg.exe in bin dir） 
-
-Linux: Visit [FFmpeg](https://ffmpeg.org/download.html) to get the most recent ffmpeg file  
-
-Put the unzipped ffmpeg file into the bin folder.  
-
-Linux also require：  
-```
-sudo apt install libopus0
-```
-
-Use the following command to start the Discord Bot:  
-```
-python main.py
-```
-
-Complete the setting through instructions, and keep the window open to ensure the Bot is running.
- 
-To change the setting, please use the following command: 
-```
-python main.py --mode=setting
-```
+---
+基于 31Zeta/Zeta-DiscordBot v0.14.0 二次开发。
