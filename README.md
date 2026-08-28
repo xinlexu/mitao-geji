@@ -32,4 +32,4 @@
 - 2026-08-04 网易云会员完整歌曲打通（Cookie + HTTPS 修复 + 异步下载）
 
 ---
-基于 31Zeta/Zeta-DiscordBot v0.14.0 二次开发。
+欢迎来到https://discord.gg/mkquYkwGyP实测体验
