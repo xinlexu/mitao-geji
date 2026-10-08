@@ -330,7 +330,7 @@ class LavalinkManager:
             guild_id = int(payload["guildId"])
             voice_client = self._voice_clients.get(guild_id)
             if voice_client is not None:
-                await voice_client._handle_lavalink_event(payload)
+                voice_client.dispatch_lavalink_event(payload)
             return
 
         if op == "stats":
@@ -368,14 +368,23 @@ class LavalinkVoiceClient(discord.VoiceProtocol):
         self._disconnecting = False
         self._voice_ready = asyncio.Event()
         self._finish_lock = asyncio.Lock()
+        self._operation_lock = asyncio.Lock()
+        self._release_callback: Optional[Callable[[], None]] = None
+        self._pending_stop_generation: Optional[int] = None
+        self._pending_stop_reason = "stopped"
+        self._advancing_generation: Optional[int] = None
+        self._event_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self._event_task: Optional[asyncio.Task[Any]] = None
         self._playing = False
         self._paused = False
         self._volume_ratio = 1.0
         self._generation = 0
+        self._playback_session_id = os.urandom(12).hex()
         self._active_encoded_track: Optional[str] = None
         self._active_audio_path: Optional[Path] = None
         self._active_ctx: Any = None
         self._after_callback: Optional[Callable[[Any], Awaitable[None]]] = None
+        self._state_changed: Optional[Callable[[], Awaitable[None]]] = None
         self._voice_state: dict[str, str] = {}
         self._last_position_ms = 0
         self._resume_after_node_ready = False
@@ -562,15 +571,24 @@ class LavalinkVoiceClient(discord.VoiceProtocol):
         self._paused = False
         self._spawn(self._patch_player({"paused": False}), "resume")
 
-    def stop(self) -> None:
-        if not self._playing and self._after_callback is None:
+    def has_active_track(self) -> bool:
+        return self._after_callback is not None or self._advancing_generation is not None
+
+    def is_stopping(self) -> bool:
+        return (self._pending_stop_generation == self._generation
+                or self._advancing_generation is not None)
+
+    def stop(self, *, reason: str = "stopped") -> None:
+        if self.is_stopping() or (not self._playing and self._after_callback is None):
             return
 
         expected_generation = self._generation
+        self._pending_stop_generation = expected_generation
+        self._pending_stop_reason = reason
         preserve_pause = self._paused
         self._playing = False
         self._spawn(
-            self._stop_and_advance(expected_generation, preserve_pause),
+            self._stop_and_advance(expected_generation, preserve_pause, reason),
             "stop-and-advance",
         )
 
@@ -583,59 +601,51 @@ class LavalinkVoiceClient(discord.VoiceProtocol):
             )
 
     async def play_zeta_audio(
-        self,
-        target_audio: Any,
-        *,
-        ctx: Any,
-        after: Callable[[Any], Awaitable[None]],
-        volume_percent: float,
+        self, target_audio: Any, *, ctx: Any,
+        after: Callable[..., Awaitable[None]], volume_percent: float,
+        release: Optional[Callable[[], None]] = None,
+        state_changed: Optional[Callable[[], Awaitable[None]]] = None,
     ) -> None:
-        if not self.is_connected() or self.manager is None:
-            raise RuntimeError("Lavalink voice connection is not ready")
-
-        raw_path = Path(target_audio.get_path())
-        audio_path = raw_path if raw_path.is_absolute() else APP_ROOT / raw_path
-        audio_path = audio_path.resolve()
-
-        if not audio_path.is_file():
-            raise FileNotFoundError(f"Audio file does not exist: {audio_path}")
-        if not os.access(audio_path, os.R_OK):
-            raise PermissionError(f"Audio file is not readable: {audio_path}")
-
-        track = await self.manager.load_local_track(audio_path)
-        encoded = str(track["encoded"])
-
-        self._generation += 1
-        self._active_encoded_track = encoded
-        self._active_audio_path = audio_path
-        self._active_ctx = ctx
-        self._after_callback = after
-        self._playing = True
-        self._last_position_ms = 0
-        self._volume_ratio = max(0.0, min(2.0, float(volume_percent) / 100.0))
-
-        try:
-            await self._patch_player(
-                {
-                    "track": {"encoded": encoded},
+        async with self._operation_lock:
+            if not self.is_connected() or self.manager is None:
+                raise RuntimeError("Lavalink voice connection is not ready")
+            expected_generation = self._generation
+            raw_path = Path(target_audio.get_path())
+            audio_path = (raw_path if raw_path.is_absolute() else APP_ROOT / raw_path).resolve()
+            if not audio_path.is_file():
+                raise FileNotFoundError(f"Audio file does not exist: {audio_path}")
+            if not os.access(audio_path, os.R_OK):
+                raise PermissionError(f"Audio file is not readable: {audio_path}")
+            track = await self.manager.load_local_track(audio_path)
+            if expected_generation != self._generation or not self.is_connected():
+                raise RuntimeError("Voice connection changed while loading audio")
+            encoded = str(track["encoded"])
+            self._clear_active_callback()
+            self._generation += 1
+            self._active_encoded_track = encoded
+            self._active_audio_path = audio_path
+            self._active_ctx = ctx
+            self._after_callback = after
+            self._release_callback = release
+            self._state_changed = state_changed
+            self._playing = True
+            self._last_position_ms = 0
+            self._volume_ratio = max(0.0, min(2.0, float(volume_percent) / 100.0))
+            try:
+                await self._patch_player({
+                    "track": {"encoded": encoded, "userData": self._track_user_data()},
                     "volume": round(self._volume_ratio * 100),
                     "paused": self._paused,
-                }
+                })
+            except BaseException:
+                self._playing = False
+                self._clear_active_callback()
+                raise
+            log.info(
+                "Playback requested guild=%s title=%r path=%s generation=%s volume=%s paused=%s",
+                self.guild_id, target_audio.get_title(), audio_path, self._generation,
+                round(self._volume_ratio * 100), self._paused,
             )
-        except Exception:
-            self._playing = False
-            self._clear_active_callback()
-            raise
-
-        log.info(
-            "Playback requested guild=%s title=%r path=%s generation=%s volume=%s paused=%s",
-            self.guild_id,
-            target_audio.get_title(),
-            audio_path,
-            self._generation,
-            round(self._volume_ratio * 100),
-            self._paused,
-        )
 
     async def _dispatch_voice_state(self) -> None:
         if self.manager is None:
@@ -703,25 +713,49 @@ class LavalinkVoiceClient(discord.VoiceProtocol):
             self._resume_after_node_ready = False
             self._spawn(self._resume_current_after_node_reconnect(), "node-resume")
 
+    def dispatch_lavalink_event(self, event: dict[str, Any]) -> None:
+        # Slow loading/message edits must not block the shared websocket reader
+        # (including heartbeat replies and events for other guilds).
+        self._event_queue.put_nowait(event)
+        if self._event_task is None or self._event_task.done():
+            self._event_task = self._spawn(self._drain_lavalink_events(), "events")
+
+    async def _drain_lavalink_events(self) -> None:
+        while not self._event_queue.empty():
+            event = self._event_queue.get_nowait()
+            try:
+                await self._handle_lavalink_event(event)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Failed processing track event guild=%s type=%s", self.guild_id, event.get("type"))
+            finally:
+                self._event_queue.task_done()
+
     async def _handle_lavalink_event(self, event: dict[str, Any]) -> None:
         event_type = str(event.get("type", ""))
         event_track = event.get("track")
         event_encoded = event_track.get("encoded") if isinstance(event_track, dict) else None
         event_info = event_track.get("info") if isinstance(event_track, dict) else None
         event_identifier = event_info.get("identifier") if isinstance(event_info, dict) else None
+        event_user_data = event_track.get("userData") if isinstance(event_track, dict) else None
+        if event_type in {"TrackStartEvent", "TrackEndEvent", "TrackStuckEvent", "TrackExceptionEvent"}:
+            if not self._event_matches_active(event_identifier, event_user_data):
+                log.info("Ignored stale track event guild=%s type=%s", self.guild_id, event_type)
+                return
 
         if event_type == "TrackStartEvent":
             log.info(
                 "Track started guild=%s title=%r track_match=%s",
                 self.guild_id,
                 (event_track.get("info") or {}).get("title") if isinstance(event_track, dict) else None,
-                self._event_matches_active(event_identifier),
+                self._event_matches_active(event_identifier, event_user_data),
             )
             return
 
         if event_type == "TrackEndEvent":
             reason = str(event.get("reason", ""))
-            if not self._event_matches_active(event_identifier):
+            if not self._event_matches_active(event_identifier, event_user_data):
                 log.info("Ignored stale TrackEnd guild=%s reason=%s", self.guild_id, reason)
                 return
 
@@ -732,11 +766,11 @@ class LavalinkVoiceClient(discord.VoiceProtocol):
                 self._generation,
             )
             if reason in {"finished", "loadFailed"}:
-                await self._complete_current(self._generation, preserve_pause=False)
+                await self._complete_current(self._generation, preserve_pause=False, reason=reason)
             return
 
         if event_type == "TrackStuckEvent":
-            if not self._event_matches_active(event_identifier):
+            if not self._event_matches_active(event_identifier, event_user_data):
                 return
             log.error(
                 "Track stuck guild=%s threshold=%r generation=%s",
@@ -744,8 +778,8 @@ class LavalinkVoiceClient(discord.VoiceProtocol):
                 event.get("thresholdMs"),
                 self._generation,
             )
-            await self._patch_player({"track": {"encoded": None}})
-            await self._complete_current(self._generation, preserve_pause=False)
+            expected_generation = self._generation
+            await self._stop_for_error(expected_generation, "stuck")
             return
 
         if event_type == "TrackExceptionEvent":
@@ -757,9 +791,9 @@ class LavalinkVoiceClient(discord.VoiceProtocol):
                 exception.get("severity"),
                 exception.get("cause"),
             )
-            if self._event_matches_active(event_identifier):
-                await self._patch_player({"track": {"encoded": None}})
-                await self._complete_current(self._generation, preserve_pause=False)
+            if self._event_matches_active(event_identifier, event_user_data):
+                expected_generation = self._generation
+                await self._stop_for_error(expected_generation, "exception")
             return
 
         if event_type == "WebSocketClosedEvent":
@@ -775,39 +809,83 @@ class LavalinkVoiceClient(discord.VoiceProtocol):
 
         log.warning("Unhandled Lavalink event guild=%s event=%r", self.guild_id, event)
 
-    async def _stop_and_advance(self, expected_generation: int, preserve_pause: bool) -> None:
-        try:
+    async def _stop_for_error(self, expected_generation: int, reason: str) -> None:
+        async with self._operation_lock:
+            if expected_generation != self._generation:
+                return
             await self._patch_player({"track": {"encoded": None}})
+        await self._complete_current(expected_generation, preserve_pause=False, reason=reason)
+
+    async def _stop_and_advance(self, expected_generation: int, preserve_pause: bool, reason: str = "stopped") -> None:
+        try:
+            async with self._operation_lock:
+                if expected_generation != self._generation:
+                    return
+                try:
+                    await self._patch_player({"track": {"encoded": None}})
+                except Exception:
+                    log.exception("Failed stopping track guild=%s", self.guild_id)
+            await self._complete_current(expected_generation, preserve_pause=preserve_pause, reason=reason)
+        finally:
+            if self._pending_stop_generation == expected_generation:
+                self._pending_stop_generation = None
+            await self._notify_state_changed()
+
+    async def _notify_state_changed(self) -> None:
+        # This observer survives track cleanup so the final empty/error state
+        # can be rendered too. Call only after releasing playback locks.
+        if self.is_stopping() or self._state_changed is None:
+            return
+        try:
+            await self._state_changed()
         except Exception:
-            log.exception("Failed stopping track guild=%s", self.guild_id)
-        await self._complete_current(expected_generation, preserve_pause=preserve_pause)
+            # UI delivery must never undo audio progress; cancellation passes
+            # through so shutdown can still cancel a pending message edit.
+            log.exception("Failed notifying settled playback state guild=%s", self.guild_id)
 
     async def _complete_current(
         self,
         expected_generation: int,
         *,
         preserve_pause: bool,
+        reason: str = "finished",
     ) -> None:
-        async with self._finish_lock:
-            if expected_generation != self._generation:
-                return
+        transition_started = False
+        try:
+            async with self._finish_lock:
+                if expected_generation != self._generation:
+                    return
 
-            callback = self._after_callback
-            ctx = self._active_ctx
-            self._playing = False
-            if not preserve_pause:
-                self._paused = False
-            self._clear_active_callback()
+                if self.is_stopping():
+                    reason = self._pending_stop_reason
 
-            if callback is not None and ctx is not None:
+                callback = self._after_callback
+                ctx = self._active_ctx
+                transition_started = True
+                self._advancing_generation = expected_generation
+                self._playing = False
+                if not preserve_pause:
+                    self._paused = False
+                self._clear_active_callback()
+
                 try:
-                    await callback(ctx)
-                except Exception:
-                    log.exception(
-                        "Zeta after callback failed guild=%s generation=%s",
-                        self.guild_id,
-                        expected_generation,
-                    )
+                    if callback is not None and ctx is not None:
+                        try:
+                            await callback(ctx, reason=reason, voice_client=self, generation=expected_generation)
+                        except Exception:
+                            log.exception(
+                                "Zeta after callback failed guild=%s generation=%s",
+                                self.guild_id,
+                                expected_generation,
+                            )
+                finally:
+                    if self._advancing_generation == expected_generation:
+                        self._advancing_generation = None
+                    if self._after_callback is None:
+                        self._paused = False
+        finally:
+            if transition_started:
+                await self._notify_state_changed()
 
     async def _on_node_ready(self) -> None:
         if self._destroyed or self.manager is None:
@@ -825,35 +903,32 @@ class LavalinkVoiceClient(discord.VoiceProtocol):
         self._voice_ready.clear()
 
     async def _resume_current_after_node_reconnect(self) -> None:
-        if (
-            self.manager is None
-            or self._active_audio_path is None
-            or not self._playing
-            or not self.is_connected()
-        ):
-            return
-
+        expected_generation = self._generation
+        audio_path = self._active_audio_path
+        resume_position = self._resume_position_ms
         try:
-            track = await self.manager.load_local_track(self._active_audio_path)
-            encoded = str(track["encoded"])
-            self._active_encoded_track = encoded
-            payload: dict[str, Any] = {
-                "track": {"encoded": encoded},
-                "volume": round(self._volume_ratio * 100),
-                "paused": self._paused,
-            }
-            resume_position = self._resume_position_ms
-            if resume_position > 0:
-                payload["position"] = resume_position
-            await self._patch_player(payload)
-            self._last_position_ms = resume_position
-            self._resume_position_ms = 0
-            log.info(
-                "Playback restored after node reconnect guild=%s position=%s path=%s",
-                self.guild_id,
-                resume_position,
-                self._active_audio_path,
-            )
+            async with self._operation_lock:
+                if (self.manager is None or audio_path is None or not self._playing
+                        or not self.is_connected() or expected_generation != self._generation):
+                    return
+                track = await self.manager.load_local_track(audio_path)
+                if (expected_generation != self._generation or audio_path != self._active_audio_path
+                        or not self._playing or not self.is_connected()):
+                    return
+                encoded = str(track["encoded"])
+                payload: dict[str, Any] = {
+                    "track": {"encoded": encoded, "userData": self._track_user_data()},
+                    "volume": round(self._volume_ratio * 100),
+                    "paused": self._paused,
+                }
+                if resume_position > 0:
+                    payload["position"] = resume_position
+                await self._patch_player(payload)
+                self._active_encoded_track = encoded
+                self._last_position_ms = resume_position
+                self._resume_position_ms = 0
+                log.info("Playback restored after node reconnect guild=%s position=%s path=%s",
+                         self.guild_id, resume_position, audio_path)
         except Exception:
             log.exception("Failed restoring playback after node reconnect guild=%s", self.guild_id)
 
@@ -863,14 +938,33 @@ class LavalinkVoiceClient(discord.VoiceProtocol):
         self._playing = False
         self._paused = False
         self._clear_active_callback()
+        task = self._event_task
+        self._event_task = None
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        while not self._event_queue.empty():
+            self._event_queue.get_nowait()
+            self._event_queue.task_done()
 
-    def _event_matches_active(self, event_identifier: Optional[str]) -> bool:
+    def _track_user_data(self) -> dict[str, Any]:
+        return {"zetaSession": self._playback_session_id, "zetaGeneration": self._generation}
+
+    def _event_matches_active(self, event_identifier: Optional[str], event_user_data: Any = None) -> bool:
         # Lavalink re-encodes the playing track for its events, so the encoded
         # blob is NOT stable across a track's lifetime (the embedded position
         # changes as the track plays). A local track's info.identifier is its
         # file path and never changes, so match on that instead.
-        if self._active_audio_path is None or event_identifier is None:
-            return True
+        # Consecutive queue entries may use the same file. Lavalink v4 echoes
+        # track.userData in events, so the playback instance must match as well.
+        if (self._active_audio_path is None or event_identifier is None
+                or not isinstance(event_user_data, dict)
+                or event_user_data.get("zetaSession") != self._playback_session_id
+                or event_user_data.get("zetaGeneration") != self._generation):
+            return False
         if str(event_identifier) == str(self._active_audio_path):
             return True
         log.warning(
@@ -882,12 +976,20 @@ class LavalinkVoiceClient(discord.VoiceProtocol):
         return False
 
     def _clear_active_callback(self) -> None:
+        release, self._release_callback = self._release_callback, None
+        self._pending_stop_generation = None
+        self._pending_stop_reason = "stopped"
+        if release is not None:
+            try:
+                release()
+            except Exception:
+                log.exception("Failed releasing active audio guild=%s", self.guild_id)
         self._active_encoded_track = None
         self._active_audio_path = None
         self._active_ctx = None
         self._after_callback = None
 
-    def _spawn(self, coro: Awaitable[Any], label: str) -> None:
+    def _spawn(self, coro: Awaitable[Any], label: str) -> asyncio.Task[Any]:
         task = self.client.loop.create_task(coro, name=f"zeta-lavalink-{label}")
 
         def _report(done: asyncio.Task[Any]) -> None:
@@ -899,6 +1001,7 @@ class LavalinkVoiceClient(discord.VoiceProtocol):
                 log.exception("Background operation failed label=%s guild=%s", label, self.guild_id)
 
         task.add_done_callback(_report)
+        return task
 
 
 _runtime_lock = asyncio.Lock()
@@ -931,4 +1034,3 @@ def _field(data: Any, name: str, default: Any = None) -> Any:
     if isinstance(data, dict):
         return data.get(name, default)
     return getattr(data, name, default)
-

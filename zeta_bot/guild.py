@@ -1,4 +1,5 @@
 import discord
+import asyncio
 import os
 from typing import Union, Optional
 
@@ -28,7 +29,10 @@ class Guild:
         self._path = f"{self._root}/{self._guild.id}.json"
         self._audio_file_library = audio_file_library
         self._play_mode = 0
+        self._playback_lock = asyncio.Lock()
+        self._loading = False
         self._active_views = {}
+        self._control_panel = {}
 
         self._playing_message = None
         self._playing_embed: Optional[discord.Embed] = None
@@ -65,6 +69,9 @@ class Guild:
     def get_playlist(self):
         return self.playlist
 
+    def get_playback_lock(self):
+        return self._playback_lock
+
     def get_playedlist(self) -> playlist.Playlist:
         return self.playedlist
 
@@ -85,6 +92,29 @@ class Guild:
     def get_active_views(self) -> dict:
         return self._active_views
 
+    @staticmethod
+    def _control_panel_metadata(value) -> dict:
+        if not isinstance(value, dict):
+            return {}
+        channel_id, message_id = value.get("channel_id"), value.get("message_id")
+        if not all(isinstance(item, int) and not isinstance(item, bool) and item > 0
+                   for item in (channel_id, message_id)):
+            return {}
+        return {"channel_id": channel_id, "message_id": message_id}
+
+    def get_control_panel(self) -> dict:
+        return self._control_panel_metadata(self._control_panel)
+
+    def set_control_panel(self, channel_id=None, message_id=None) -> None:
+        if channel_id is None and message_id is None:
+            panel = {}
+        else:
+            panel = self._control_panel_metadata({"channel_id": channel_id, "message_id": message_id})
+            if not panel:
+                raise ValueError("control panel channel_id and message_id must both be positive integers")
+        self._control_panel = panel
+        self.save()
+
     def set_voice_volume(self, volume: Union[int, float]) -> None:
         self.voice_volume = float(volume)
 
@@ -100,6 +130,7 @@ class Guild:
         if mode_code not in [0, 1, 2, 3, 4]:
             return False
         self._play_mode = mode_code
+        self.save()
         return True
 
     async def refresh_list_view(self) -> None:
@@ -109,31 +140,45 @@ class Guild:
     async def refresh_playing_message(self, new_message, new_embed: Optional[discord.Embed]) -> None:
         playing_message = self._playing_message
         playing_embed = self._playing_embed
+        # Forget the old message even when it was deleted or can no longer be edited.
+        self._playing_message = new_message
+        self._playing_embed = new_embed
         if playing_embed is not None and playing_message is not None:
             finished_icon_filename = "check_in_box_in_reveal_animated_0ms_100px.gif"
             playing_embed.set_author(name="播放完成" + playing_embed.author.name[4:], icon_url=icon.url(finished_icon_filename))
 
-            if isinstance(playing_message, discord.Interaction):
-                await playing_message.edit_original_response(content=None, embed=playing_embed, files=icon_lib.files(finished_icon_filename))
-            else:
-                await playing_message.edit(content=None, embed=playing_embed, files=icon_lib.files(finished_icon_filename))
-
-        self._playing_message = new_message
-        self._playing_embed = new_embed
+            try:
+                if isinstance(playing_message, discord.Interaction):
+                    await playing_message.edit_original_response(content=None, embed=playing_embed, files=icon_lib.files(finished_icon_filename))
+                else:
+                    await playing_message.edit(content=None, embed=playing_embed, files=icon_lib.files(finished_icon_filename))
+            except discord.HTTPException:
+                await console.rp("旧播放提示已删除或无法编辑，继续播放", self._guild)
 
     def save(self) -> None:
+        if self._loading:
+            return
         utils.json_save(self._path, self)
 
     def load(self) -> None:
         loaded_dict = utils.json_load(self._path)
-        self.playedlist = playlist.playlist_decoder(loaded_dict["playedlist"])
-        self.playlist = GuildPlaylist(self, self._audio_file_library)
-        guild_playlist_loader(self.playlist, loaded_dict["playlist"])
+        self._loading = True
+        try:
+            self.playedlist = playlist.playlist_decoder(loaded_dict["playedlist"])
+            self.playlist = GuildPlaylist(self, self._audio_file_library)
+            guild_playlist_loader(self.playlist, loaded_dict["playlist"])
+            mode = loaded_dict.get("play_mode", 0)
+            self._play_mode = mode if mode in (0, 1, 2, 3, 4) else 0
+            self._control_panel = self._control_panel_metadata(loaded_dict.get("control_panel"))
+        finally:
+            self._loading = False
 
     def encode(self) -> dict:
         return {
             "id": self._id,
             "name": self._name,
+            "play_mode": self._play_mode,
+            "control_panel": self.get_control_panel(),
             "playlist": self.playlist,
             "playedlist": self.playedlist
         }
@@ -243,6 +288,14 @@ class GuildPlaylist(playlist.Playlist):
 
     def get_file_library(self):
         return self._file_library
+
+    def move_audio(self, from_index: int, to_index: int) -> None:
+        super().move_audio(from_index, to_index)
+        self._guild.save()
+
+    def swap_audio(self, index_1: int, index_2: int) -> None:
+        super().swap_audio(index_1, index_2)
+        self._guild.save()
 
     def pop_audio(self, index=0) -> Union[audio.Audio, None]:
         """

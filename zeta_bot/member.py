@@ -264,11 +264,13 @@ class MemberLibrary:
                 user_dict["name"] = user_name
             if ctx.guild is not None:
                 # 更新用户服务器数据
-                if ctx.guild.id not in user_dict["guilds"]:
-                    user_dict["guilds"][ctx.guild.id] = {"nickname": ctx.user.nick, "language": lang.system_language}
+                guild_key = str(ctx.guild.id)
+                if guild_key not in user_dict["guilds"]:
+                    user_dict["guilds"][guild_key] = {"nickname": ctx.user.nick, "language": lang.system_language}
                 # 更新用户此服务器的昵称
-                if ctx.user.nick != user_dict["guilds"][ctx.guild.id]["nickname"]:
-                    user_dict["guilds"][ctx.guild.id]["nickname"] = ctx.user.nick
+                if ctx.user.nick != user_dict["guilds"][guild_key]["nickname"]:
+                    user_dict["guilds"][guild_key]["nickname"] = ctx.user.nick
+                user_dict["guilds"][guild_key].setdefault("language", lang.system_language)
             # 更新#Members文件
             self.load_hashtag_file()
             if user_id not in self.hashtag_file or user_name != self.hashtag_file[user_id]:
@@ -284,9 +286,9 @@ class MemberLibrary:
                 "name": user_name,
                 "group": "standard",
                 "language": lang.system_language,
-                "guilds": {ctx.guild.id: {
-                    "nickname": ctx.user.nick},
-                },
+                "guilds": ({str(ctx.guild.id): {
+                    "nickname": ctx.user.nick, "language": lang.system_language}
+                } if ctx.guild is not None else {}),
                 "data": {"first_contact": utils.ctime_str(), "play_counter": 0},
                 "property": {"playlists": []}
             }
@@ -315,7 +317,7 @@ class MemberLibrary:
         user_id = ctx.user.id
         path = f"{self.root}/{user_id}.json"
         user_dict = utils.json_load(path)
-        return user_dict["guilds"][ctx.guild.id]["language"]
+        return user_dict["guilds"].get(str(ctx.guild.id), {}).get("language", user_dict["language"])
 
     def get_group(self, user_id) -> str:
         path = f"{self.root}/{user_id}.json"

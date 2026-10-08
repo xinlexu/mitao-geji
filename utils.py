@@ -12,8 +12,10 @@ import shutil
 import platform
 import importlib.metadata
 import packaging.requirements
+import tempfile
 
 import errors
+from zeta_bot.url_safety import (check_url_source, get_url_from_str, get_legal_netease_url, get_redirect_url)
 
 
 def ctime_str() -> str:
@@ -45,16 +47,24 @@ def json_save(json_path: str, saving_item) -> None:
     将<saving_item>以json格式保存到<json_path>
     **警告**：json格式的键值必须为字符串，否则会被转换为字符串
     """
-    with open(json_path, "w", encoding="utf-8") as file:
-        file.write(
-            json.dumps(
-                saving_item,
-                default=lambda x: x.encode(),
-                sort_keys=False,
-                indent=4,
-                ensure_ascii=False
-            )
-        )
+    # Serialize before touching the previous file; replace a complete file
+    # on the same filesystem and preserve the previous access mode.
+    payload = json.dumps(saving_item, default=lambda x: x.encode(),
+                         sort_keys=False, indent=4, ensure_ascii=False)
+    destination = os.path.abspath(os.fspath(json_path))
+    directory = os.path.dirname(destination)
+    previous_mode = os.stat(destination).st_mode & 0o777 if os.path.exists(destination) else 0o600
+    fd, temporary = tempfile.mkstemp(prefix=".json-save-", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
+            file.write(payload)
+            file.flush()
+            os.fsync(file.fileno())
+        os.chmod(temporary, previous_mode)
+        os.replace(temporary, destination)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def json_load(json_path: str) -> Union[dict, list]:
@@ -856,97 +866,12 @@ def convert_byte(byte: int) -> Tuple[float, str]:
         return byte, "字节"
 
 
-def check_url_source(url) -> Union[str, None]:
-
-    if re.search("bilibili\.com", url) is not None:
-        return "bilibili_url"
-
-    elif re.search("b23\.tv", url) is not None:
-        return "bilibili_short_url"
-
-    elif re.search("BV(\d|[a-zA-Z]){10}", url) is not None:
-        return "bilibili_bvid"
-
-    elif re.search("youtube\.com", url) is not None:
-        return "youtube_url"
-
-    elif re.search("youtu\.be", url) is not None:
-        return "youtube_short_url"
-
-    elif re.search("music.163\.com", url) is not None:
-        return "netease_url"
-
-    elif re.search("163cn\.tv", url) is not None:
-        return "netease_short_url"
-
-    else:
-        return None
 
 
-def get_url_from_str(input_str, url_type) -> Union[str, None]:
-
-    if url_type == "bilibili_url":
-        url_position = re.search(r"bilibili\.com[^ ]*", input_str).span()
-        url = "https://" + input_str[url_position[0]:url_position[1]]
-        return url
-
-    elif url_type == "bilibili_short_url":
-        url_position = re.search(r"b23\.tv[^ ]*", input_str).span()
-        url = "https://" + input_str[url_position[0]:url_position[1]]
-        return url
-
-    elif url_type == "bilibili_bvid":
-        bvid_position = re.search(r"BV(\d|[a-zA-Z]){10}", input_str).span()
-        bvid = input_str[bvid_position[0]:bvid_position[1]]
-        return bvid
-
-    elif url_type == "youtube_url":
-        url_position = re.search(r"youtube\.com[^ ]*", input_str).span()
-        url = "https://" + input_str[url_position[0]:url_position[1]]
-        return url
-
-    elif url_type == "youtube_short_url":
-        url_position = re.search(r"youtu\.be[^ ]*", input_str).span()
-        url = "https://" + input_str[url_position[0]:url_position[1]]
-        return url
-
-    elif url_type == "netease_url":
-        url_position = re.search(r"music.163\.com[^ ]*", input_str).span()
-        url = "https://" + input_str[url_position[0]:url_position[1]]
-        return url
-
-    elif url_type == "netease_short_url":
-        url_position = re.search(r"163cn\.tv[^ ]*", input_str).span()
-        url = "https://" + input_str[url_position[0]:url_position[1]]
-        return url
-
-    else:
-        return None
 
 
-def get_legal_netease_url(input_str) -> Union[str, None]:
-    if "song?id=" in input_str:
-        id_position = re.search("song\?id=\d+", input_str).span()
-    elif "playlist?id=" in input_str:
-        id_position = re.search("playlist\?id=\d+", input_str).span()
-    else:
-        return None
-    return "https://music.163.com/#/" + input_str[id_position[0]:id_position[1]]
 
 
-def get_redirect_url(url) -> str:
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-    }
-
-    # 请求网页
-    response = requests.get(url, headers=headers)
-
-    # print(response.status_code)  # 打印响应的状态码
-    # print(response.url)  # 打印重定向后的网址
-
-    # 返回重定向后的网址
-    return str(response.url)
 
 
 def get_bvid_from_url(url):
@@ -956,7 +881,7 @@ def get_bvid_from_url(url):
     :param url: 目标地址
     :return:
     """
-    re_result = re.search("BV(\d|[a-zA-Z]){10}", url)
+    re_result = re.search(r"BV(\d|[a-zA-Z]){10}", url)
 
     if re_result is None:
         return None
@@ -1204,7 +1129,7 @@ class DoubleLinkedListDict:
         :param force: 如果键值已存在，<force>为True则清除掉原有节点后添加当前节点，默认为False
         """
         new_node = DoubleLinkedNode(item, key)
-        self.index_insert(index, new_node, force)
+        self._index_insert_node(index, new_node, force)
 
     def key_remove(self, key) -> None:
         """
@@ -1235,36 +1160,8 @@ class DoubleLinkedListDict:
             raise KeyError(key)
 
     def index_remove(self, index: int) -> None:
-        """
-        将索引值<index>对应对象的节点移出双向链表字典
-
-        :param index: 需要移除的对象对应的索引值
-        """
-        if index < 0:
-            raise IndexError
-        elif index == 0 and self._length == 1:
-            self._remove_node_dict(self._head)
-            self._head = None
-            self._tail = None
-        elif index == 0:
-            self._remove_node_dict(self._head)
-            self._head.next.prev = None
-            self._head = self._head.next
-        elif index == self._length - 1:
-            self._remove_node_dict(self._tail)
-            self._tail.prev.next = None
-            self._tail = self._tail.prev
-        elif index >= self._length:
-            raise IndexError
-        else:
-            current = self._index_get_node(index)
-            prev_node = current.prev
-            next_node = current.next
-            prev_node.next = next_node
-            next_node.prev = prev_node
-            self._remove_node_dict(current)
-
-        self._length -= 1
+        current = self._index_get_node(index)
+        self.key_remove(current.key)
 
     def key_swap(self, key_1, key_2):
         """

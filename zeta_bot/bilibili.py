@@ -1,6 +1,8 @@
 from typing import *
 import aiohttp
 import html
+from pathlib import Path
+import tempfile
 from bilibili_api import video, Credential, sync, select_client
 from bilibili_api import search as bilibili_search
 
@@ -9,7 +11,8 @@ import utils
 
 from zeta_bot import (
     console,
-    audio
+    audio,
+    media_cache
 )
 
 # https://bili.moyu.moe/#/examples/video
@@ -73,8 +76,9 @@ async def get_filesize(info_dict: dict, num_p=0) -> Union[int, None]:
     async with aiohttp.ClientSession() as sess:
         # 下载音频流
         async with sess.get(audio_url, headers=headers) as resp:
+            resp.raise_for_status()
             length = resp.headers.get('content-length')
-            return int(length)
+            return int(length) if length is not None else None
 
     return None
 
@@ -84,93 +88,59 @@ async def get_filesize(info_dict: dict, num_p=0) -> Union[int, None]:
 #   Not enough data to satisfy content length header.
 # aiohttp.client_exceptions.ClientPayloadError: Response payload is not completed: <ContentLengthError: 400, message='Not enough data to satisfy content length header.'>
 
-async def audio_download(info_dict: dict, download_path: str, download_type="bilibili_single", num_p=0) -> audio.Audio:
-    """
-    使用bilibili_api，下载来自哔哩哔哩的音频
-    需要处理以下异常：
-        - bilibili_api.ResponseCodeException 接口无响应（视频不存在）
-        - bilibili_api.ArgsException 参数错误（bvid错误）
-        - httpx.ConnectTimeout 连接超时（可重试）
-        - httpx.RemoteProtocolError 服务器违反了协议（可重试）
-    """
+async def audio_download(info_dict: dict, download_path: str, download_type="bilibili_single", num_p=0, budget=None) -> audio.Audio:
     bvid = info_dict["bvid"]
-    # 实例化 Credential 类
     credential = Credential(sessdata=SESSDATA, bili_jct=BILI_JCT, buvid3=BUVID3)
-    # 实例化 Video 类
     v = video.Video(bvid=bvid, credential=credential)
-
-    if download_type == "bilibili_p":
-        title = info_dict["pages"][num_p]["part"]
-    # 普通下载
-    else:
-        title = info_dict["title"]
-
-    original_title = title
-    title = utils.legal_name(title)
-    duration = int(info_dict["pages"][num_p]["duration"])
-
-    path = f"{download_path}/{title}.mp3"
-
-    # 获取视频下载链接
-    url = await v.get_download_url(num_p)
-
-    # 音频轨链接
-    audio_url = url["dash"]["audio"][0]['baseUrl']
-
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Referer": "https://www.bilibili.com/"
-    }
-
-    # print(current_time + f"\n    开始下载: {title}.mp3\n下载进度:")
-
-    async with aiohttp.ClientSession() as sess:
-        # 下载音频流
-        async with sess.get(audio_url, headers=headers) as resp:
-            length = resp.headers.get('content-length')
-            size = utils.convert_byte(int(length))
-            await console.rp(f"开始下载：{title}.mp3 大小：{size[0]} {size[1]}", f"[{level}]")
-            with open(path, 'wb') as f:
-                process = 0
-                while True:
-                    chunk = await resp.content.read(1024)
-                    if not chunk:
-                        break
-
-                    process += len(chunk)
-                    f.write(chunk)
-                    # TODO 待定 可以添加聊天界面进度显示
-                    # 旧版进度显示
-                    # print(f'\r    {process} / {length}', end="")
-
-    # print("\n\n" + current_time + f"\n    下载完成\n")
-
-    new_audio = audio.Audio(original_title, download_type, bvid, path, duration)
-
-    if "pic" in info_dict.keys():
+    title = info_dict["pages"][num_p]["part"] if download_type == "bilibili_p" else info_dict["title"]
+    duration = int(info_dict["pages"][num_p].get("duration") or 0)
+    filename = media_cache.media_filename(download_type, bvid, "m4a", num_p)
+    download_info = await v.get_download_url(num_p)
+    audio_url = download_info["dash"]["audio"][0]["baseUrl"]
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://www.bilibili.com/"}
+    await console.rp(f"开始下载：{title}", f"[{level}]")
+    process = 0
+    try:
+        with tempfile.TemporaryDirectory(prefix=".cache-work-", dir=download_path) as temporary:
+            if budget is not None:
+                budget.staging_path = temporary
+            staged_path = Path(temporary) / filename
+            async with aiohttp.ClientSession() as sess:
+                async with sess.get(audio_url, headers=headers) as resp:
+                    resp.raise_for_status()
+                    length = resp.headers.get("content-length")
+                    expected = int(length) if length is not None else None
+                    content_type = resp.headers.get("content-type", "").lower()
+                    if content_type.startswith("text/") or "json" in content_type:
+                        raise aiohttp.ClientPayloadError("CDN returned a non-audio response")
+                    if budget is not None and expected is not None and expected > budget.limit:
+                        raise errors.StorageFull("音频文件库")
+                    with open(staged_path, "wb") as output:
+                        while True:
+                            chunk = await resp.content.read(65536)
+                            if not chunk:
+                                break
+                            if process == 0 and chunk.lstrip().lower().startswith((b"<html", b"<!doctype html")):
+                                raise aiohttp.ClientPayloadError("CDN returned an HTML response")
+                            if budget is not None:
+                                await budget.reserve(process + len(chunk))
+                            output.write(chunk)
+                            process += len(chunk)
+                    if not process or (expected is not None and process != expected):
+                        raise aiohttp.ClientPayloadError("Incomplete audio response")
+            if budget is not None:
+                await budget.reserve(process)
+            path = media_cache.publish_download(staged_path, download_path, filename)
+    finally:
+        if budget is not None:
+            budget.staging_path = None
+    # Keep source_id as the public BV identifier. The cache index separately
+    # carries the P number, and existing queue serialization remains compatible.
+    new_audio = audio.Audio(title, download_type, bvid, path, duration)
+    if info_dict.get("pic"):
         new_audio.set_cover_url(info_dict["pic"])
-
-    if download_type == "bilibili_p":
-        logger_prompt = (
-            f"下载完成\n"
-            f"文件名：{title}.mp3\n"
-            f"来源：[哔哩哔哩] {bvid}\n"
-            f"分P号：{num_p + 1}\n"
-            f"路径：{download_path}\n"
-            f"大小：{size[0]} {size[1]}\n"
-            f"时长：{utils.convert_duration_to_str(duration)}"
-        )
-    else:
-        logger_prompt = (
-            f"下载完成\n"
-            f"文件名：{title}.mp3\n"
-            f"来源：[哔哩哔哩] {bvid}\n"
-            f"路径：{download_path}\n"
-            f"大小：{size[0]} {size[1]}\n"
-            f"时长：{utils.convert_duration_to_str(duration)}"
-        )
-    await console.rp(logger_prompt, f"[{level}]")
-
+    size = utils.convert_byte(process)
+    await console.rp(f"下载完成：{title} [{bvid}] P{num_p + 1}，{size[0]} {size[1]}", f"[{level}]")
     return new_audio
 
 
