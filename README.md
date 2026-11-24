@@ -19,10 +19,14 @@
 ## 架构
 
 - 歌曲解析与下载：yt-dlp（网易云会员 Cookie，本地缓存）
-- 语音发送与 DAVE(E2EE) 加密：Lavalink 4.2.2（koe / libdave），独立 systemd 服务
+- 语音发送与 DAVE(E2EE) 加密：Lavalink 4.2.2（koe / libdave），独立服务
 - 机器人本体：Python / Pycord，对接层 `zeta_bot/lavalink_backend.py`
 
-## 运维速查（服务器上执行）
+## 当前部署
+
+2026-11-24 已迁移到 Intel Mac，使用独立运行时和 launchd 登录服务。云端机器人已停用并保留回滚。Mac 可以息屏，但应保持接电、联网、不进入系统睡眠；重启后需登录用户。详见 [Mac 部署与回滚说明](migration/macos/README.md)。
+
+## 云端运维速查（仅回滚后使用）
 
 - 服务状态：`systemctl status zeta-bot zeta-lavalink`
 - 实时日志：`journalctl -u zeta-bot -f -o cat`
@@ -30,13 +34,15 @@
 - 同步代码前先核对服务器与仓库差异，只提交源码、文档和测试；配置、Cookie、Token、队列和下载缓存不入库
 - 详见《蜜桃歌姬-维护手册.md》与 migration/ 目录
 
-`migration/` 保留历史迁移脚本。已迁移的服务器不要重复执行旧脚本覆盖当前后端，当前仓库源码为准。
+`migration/` 根目录保留历史迁移脚本，`migration/macos/` 记录当前 Mac 部署。不要重复执行旧脚本覆盖当前后端，以当前仓库源码为准。
 
 ## 回归检查
 
 运行 `python tests/run_regression.py`，分别执行 13 组离线测试（235 项）。这些检查使用模拟的网络及播放 I/O，不登录 Discord、不下载歌曲，也不修改生产队列。
 
 ## 更新日志
+
+- 2026-11-24 修复网易云 App 分享链接、B站 CDN 下载与 YouTube 播放器脚本；迁移至 Intel Mac，并修正后台调度造成的声音断续
 
 - 2026-10-08 同步当前生产源码；用户反馈日常使用正常
 - 2026-10-04 修复播放队列、缓存与下载边界问题；加入按歌名选歌和常驻控制面板；修复切歌完成后面板仍显示“正在切歌”的刷新遗漏
