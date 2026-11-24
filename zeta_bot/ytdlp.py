@@ -58,6 +58,9 @@ def _youtube_dl(options):
         extractor_args = copy.deepcopy(options.get("extractor_args") or {})
         youtube_args = extractor_args.setdefault("youtube", {})
         youtube_args.setdefault("player_client", ["default", "web_embedded"])
+        # The TV player script avoids the EJS addOnDisposeCallback failure.
+        # This selects a script variant, leaving the playback clients intact.
+        youtube_args.setdefault("player_js_variant", ["tv"])
         options["extractor_args"] = extractor_args
         if cookiefile:
             options["cookiefile"] = cookiefile

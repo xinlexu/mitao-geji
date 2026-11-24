@@ -32,6 +32,29 @@ console = console.Console()
 
 level = "哔哩哔哩模块"
 
+# 2026-11-24 服务器实测：B站音频 CDN 对不带 Range 的请求返回 HTTP 567（只换 UA、加 Origin/Accept 无效），
+# 加上 Range: bytes=0- 后返回 206 和整首音频（Content-Range 0-末尾），Content-Length 校验保持有效。
+# 其余为浏览器常规请求头。
+DOWNLOAD_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36",
+    "Referer": "https://www.bilibili.com/",
+    "Origin": "https://www.bilibili.com",
+    "Accept": "*/*",
+    "Range": "bytes=0-",
+}
+
+
+def _audio_url_candidates(audio_info: dict) -> list:
+    """同一次 playurl 返回的主地址和备用地址；Akamai 海外节点在服务器实测中返回 403，排在最后。"""
+    urls = [audio_info.get("baseUrl") or audio_info.get("base_url")]
+    urls += list(audio_info.get("backupUrl") or audio_info.get("backup_url") or [])
+    unique = []
+    for url in urls:
+        if url and url not in unique:
+            unique.append(url)
+    return sorted(unique, key=lambda url: "akamaized.net" in url.split("?", 1)[0])
+
+
 async def get_info(bvid) -> dict:
     """
     返回视频信息
@@ -56,10 +79,7 @@ async def get_info(bvid) -> dict:
 
 
 async def get_filesize(info_dict: dict, num_p=0) -> Union[int, None]:
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Referer": "https://www.bilibili.com/"
-    }
+    headers = dict(DOWNLOAD_HEADERS)
 
     bvid = info_dict["bvid"]
     # 实例化 Credential 类
@@ -70,15 +90,19 @@ async def get_filesize(info_dict: dict, num_p=0) -> Union[int, None]:
     # 获取视频下载链接
     url = await v.get_download_url(num_p)
 
-    # 音频轨链接
-    audio_url = url["dash"]["audio"][0]['baseUrl']
+    # 音频轨链接（主地址被拒绝时依次尝试同一响应中的备用地址）
+    candidates = _audio_url_candidates(url["dash"]["audio"][0])
 
     async with aiohttp.ClientSession() as sess:
-        # 下载音频流
-        async with sess.get(audio_url, headers=headers) as resp:
-            resp.raise_for_status()
-            length = resp.headers.get('content-length')
-            return int(length) if length is not None else None
+        for index, audio_url in enumerate(candidates):
+            try:
+                async with sess.get(audio_url, headers=headers) as resp:
+                    resp.raise_for_status()
+                    length = resp.headers.get('content-length')
+                    return int(length) if length is not None else None
+            except aiohttp.ClientResponseError:
+                if index == len(candidates) - 1:
+                    raise
 
     return None
 
@@ -96,8 +120,8 @@ async def audio_download(info_dict: dict, download_path: str, download_type="bil
     duration = int(info_dict["pages"][num_p].get("duration") or 0)
     filename = media_cache.media_filename(download_type, bvid, "m4a", num_p)
     download_info = await v.get_download_url(num_p)
-    audio_url = download_info["dash"]["audio"][0]["baseUrl"]
-    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://www.bilibili.com/"}
+    candidates = _audio_url_candidates(download_info["dash"]["audio"][0])
+    headers = dict(DOWNLOAD_HEADERS)
     await console.rp(f"开始下载：{title}", f"[{level}]")
     process = 0
     try:
@@ -106,28 +130,36 @@ async def audio_download(info_dict: dict, download_path: str, download_type="bil
                 budget.staging_path = temporary
             staged_path = Path(temporary) / filename
             async with aiohttp.ClientSession() as sess:
-                async with sess.get(audio_url, headers=headers) as resp:
-                    resp.raise_for_status()
-                    length = resp.headers.get("content-length")
-                    expected = int(length) if length is not None else None
-                    content_type = resp.headers.get("content-type", "").lower()
-                    if content_type.startswith("text/") or "json" in content_type:
-                        raise aiohttp.ClientPayloadError("CDN returned a non-audio response")
-                    if budget is not None and expected is not None and expected > budget.limit:
-                        raise errors.StorageFull("音频文件库")
-                    with open(staged_path, "wb") as output:
-                        while True:
-                            chunk = await resp.content.read(65536)
-                            if not chunk:
-                                break
-                            if process == 0 and chunk.lstrip().lower().startswith((b"<html", b"<!doctype html")):
-                                raise aiohttp.ClientPayloadError("CDN returned an HTML response")
-                            if budget is not None:
-                                await budget.reserve(process + len(chunk))
-                            output.write(chunk)
-                            process += len(chunk)
-                    if not process or (expected is not None and process != expected):
-                        raise aiohttp.ClientPayloadError("Incomplete audio response")
+                for index, audio_url in enumerate(candidates):
+                    try:
+                        async with sess.get(audio_url, headers=headers) as resp:
+                            resp.raise_for_status()
+                            length = resp.headers.get("content-length")
+                            expected = int(length) if length is not None else None
+                            content_type = resp.headers.get("content-type", "").lower()
+                            if content_type.startswith("text/") or "json" in content_type:
+                                raise aiohttp.ClientPayloadError("CDN returned a non-audio response")
+                            if budget is not None and expected is not None and expected > budget.limit:
+                                raise errors.StorageFull("音频文件库")
+                            with open(staged_path, "wb") as output:
+                                while True:
+                                    chunk = await resp.content.read(65536)
+                                    if not chunk:
+                                        break
+                                    if process == 0 and chunk.lstrip().lower().startswith((b"<html", b"<!doctype html")):
+                                        raise aiohttp.ClientPayloadError("CDN returned an HTML response")
+                                    if budget is not None:
+                                        await budget.reserve(process + len(chunk))
+                                    output.write(chunk)
+                                    process += len(chunk)
+                            if not process or (expected is not None and process != expected):
+                                raise aiohttp.ClientPayloadError("Incomplete audio response")
+                        break
+                    except aiohttp.ClientResponseError:
+                        # 只在节点直接拒绝（尚未写入任何音频字节）时改用同一响应里的下一个地址
+                        if process or index == len(candidates) - 1:
+                            raise
+                        await console.rp(f"音频节点拒绝请求，改用备用地址（{index + 2}/{len(candidates)}）", f"[{level}]")
             if budget is not None:
                 await budget.reserve(process)
             path = media_cache.publish_download(staged_path, download_path, filename)

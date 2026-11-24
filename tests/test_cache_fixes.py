@@ -21,6 +21,12 @@ import uuid
 SOURCE = Path(__file__).resolve().parent.parent
 
 
+def module_constant(path, name):
+    tree = ast.parse((SOURCE / path).read_text(encoding='utf-8-sig'))
+    node = next(n for n in tree.body if isinstance(n, ast.Assign) and getattr(n.targets[0], 'id', None) == name)
+    return ast.literal_eval(node.value)
+
+
 def definitions(path, names=None, namespace=None):
     tree = ast.parse((SOURCE / path).read_text(encoding='utf-8-sig'))
     tree.body = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and (names is None or node.name in names)]
@@ -86,6 +92,9 @@ class Offline:
             'COMBINED_COOKIE_FILE': str(self.root/'combined-missing.txt'),
         })
         self.bili_status = 200
+        self.bili_status_by_url = {}
+        self.bili_audio = {'baseUrl': 'OFFLINE'}
+        self.bili_requests = []
         self.bili_payload = b'fake-audio'
         self.bili_type = 'audio/mp4'
         self.bili_length = True
@@ -100,7 +109,8 @@ class Offline:
                 result, self.data = self.data[:size], self.data[size:]
                 return result
         class Response:
-            def __init__(self):
+            def __init__(self, url='OFFLINE'):
+                self.url = url
                 self.headers = {'content-type': owner.bili_type}
                 if owner.bili_length:
                     self.headers['content-length'] = str(len(owner.bili_payload))
@@ -110,26 +120,29 @@ class Offline:
             async def __aexit__(self, *args):
                 pass
             def raise_for_status(self):
-                if owner.bili_status >= 400:
-                    raise ClientResponseError(str(owner.bili_status))
+                status = owner.bili_status_by_url.get(self.url, owner.bili_status)
+                if status >= 400:
+                    raise ClientResponseError(str(status))
         class Session:
             async def __aenter__(self):
                 return self
             async def __aexit__(self, *args):
                 pass
-            def get(self, *args, **kwargs):
-                return Response()
+            def get(self, url='OFFLINE', *args, **kwargs):
+                owner.bili_requests.append((url, dict(kwargs.get('headers') or {})))
+                return Response(url)
         class Video:
             def __init__(self, *args, **kwargs):
                 pass
             async def get_download_url(self, part):
-                return {'dash': {'audio': [{'baseUrl': 'OFFLINE'}]}}
+                return {'dash': {'audio': [dict(owner.bili_audio)]}}
         self.aiohttp = SimpleNamespace(ClientSession=Session, ClientResponseError=ClientResponseError, ClientPayloadError=ClientPayloadError)
-        self.bilibili = definitions('zeta_bot/bilibili.py', {'get_filesize', 'audio_download'}, {
+        self.bilibili = definitions('zeta_bot/bilibili.py', {'get_filesize', 'audio_download', '_audio_url_candidates'}, {
             'Path': Path, 'tempfile': tempfile, 'audio': self.audio, 'utils': self.utils,
             'console': self.console, 'level': 'OFFLINE', 'media_cache': self.media_cache, 'errors': self.errors,
             'Credential': lambda **kwargs: None, 'SESSDATA': '', 'BILI_JCT': '', 'BUVID3': '',
             'video': SimpleNamespace(Video=Video), 'aiohttp': self.aiohttp,
+            'DOWNLOAD_HEADERS': module_constant('zeta_bot/bilibili.py', 'DOWNLOAD_HEADERS'),
         })
         self.fm = definitions('zeta_bot/file_management.py', namespace={
             'asyncio': asyncio, 'Counter': Counter, 'hashlib': hashlib, 'os': os, 'Path': Path, 'shutil': shutil,
@@ -288,6 +301,34 @@ class CacheFixTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(lib), 0)
         self.assertEqual(list(Path(lib._root).iterdir()), [])
 
+    async def test_bilibili_rejected_node_falls_back_within_same_playurl_response(self):
+        lib = await self.env.library()
+        info = {'bvid': 'BVTEST', 'title': 'T', 'pages': [{'duration': 1}]}
+        akamai = 'https://upos-hz-mirrorakam.akamaized.net/a.m4s?e=1'
+        cos = 'https://upos-sz-mirrorcos.bilivideo.com/a.m4s?e=1'
+        hw = 'https://upos-sz-mirrorhw.bilivideo.com/a.m4s?e=1'
+        # Akamai primary is tried last; a rejected bilivideo node falls back to the next one.
+        self.env.bili_audio = {'baseUrl': akamai, 'backupUrl': [cos, hw]}
+        self.env.bili_status_by_url = {akamai: 403, cos: 403}
+        item = await lib.download_bilibili(info, 'bilibili_single')
+        self.assertEqual([url for url, _ in self.env.bili_requests], [cos, hw])
+        self.assertTrue(all(h.get('Range') == 'bytes=0-' for _, h in self.env.bili_requests))
+        self.assertEqual(Path(item.get_path()).read_bytes(), self.env.bili_payload)
+        lib.release_pending_audio(item)
+
+    async def test_bilibili_all_nodes_rejected_raises_and_caches_nothing(self):
+        lib = await self.env.library()
+        info = {'bvid': 'BVOTHER', 'title': 'T', 'pages': [{'duration': 1}]}
+        akamai = 'https://upos-hz-mirrorakam.akamaized.net/b.m4s'
+        cos = 'https://upos-sz-mirrorcos.bilivideo.com/b.m4s'
+        self.env.bili_audio = {'baseUrl': akamai, 'backup_url': [cos, cos]}
+        self.env.bili_status_by_url = {akamai: 403, cos: 403}
+        with self.assertRaises(self.env.aiohttp.ClientResponseError):
+            await lib.download_bilibili(info, 'bilibili_single')
+        self.assertEqual([url for url, _ in self.env.bili_requests], [cos, akamai])
+        self.assertEqual(len(lib), 0)
+        self.assertEqual(list(Path(lib._root).iterdir()), [])
+
     async def test_bilibili_chunked_audio_without_content_length_is_valid(self):
         lib = await self.env.library()
         self.env.bili_length = False
@@ -399,6 +440,7 @@ class CacheFixTests(unittest.IsolatedAsyncioTestCase):
         before = copy.deepcopy(options)
         with self.env.ytdlp._youtube_dl(options) as ydl:
             self.assertEqual(ydl.options['extractor_args']['youtube']['player_client'], ['default', 'web_embedded'])
+            self.assertEqual(ydl.options['extractor_args']['youtube']['player_js_variant'], ['tv'])
             self.assertFalse(ydl.options['quiet'])
             self.assertEqual(ydl.options['format'], 'bestaudio')
             self.assertEqual(ydl.options['extractor_args']['netease'], {'custom': ['unchanged']})
@@ -423,6 +465,15 @@ class CacheFixTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.env.ydl_options), 3)
         for options in self.env.ydl_options:
             self.assertEqual(options['extractor_args']['youtube']['player_client'], ['default', 'web_embedded'])
+            self.assertEqual(options['extractor_args']['youtube']['player_js_variant'], ['tv'])
+
+    async def test_explicit_player_script_variant_is_preserved_and_copied(self):
+        options = {'extractor_args': {'youtube': {'player_js_variant': ['main']}}}
+        before = copy.deepcopy(options)
+        with self.env.ytdlp._youtube_dl(options) as ydl:
+            self.assertEqual(ydl.options['extractor_args']['youtube']['player_js_variant'], ['main'])
+            ydl.options['extractor_args']['youtube']['player_js_variant'].append('tv')
+        self.assertEqual(options, before)
 
 
 if __name__ == '__main__':

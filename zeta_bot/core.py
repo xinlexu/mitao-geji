@@ -1821,12 +1821,20 @@ async def download_bilibili_audio(ctx: discord.ApplicationContext, info_dict, au
         )
         return {"audio": None, "exception": e, "message": "参数错误，请检查链接中的BV号是否正确完整", "retryable": False}
     except aiohttp.ClientResponseError as e:
+        status = getattr(e, "status", None)
         await console.rp(
-            f"触发异常aiohttp.ClientResponseError，{title}获取失败，可能为请求繁忙",
+            f"触发异常aiohttp.ClientResponseError（HTTP {status}），{title}获取失败",
             ctx.guild,
             message_type=utils.PrintType.ERROR,
             print_head=True
         )
+        if status in (412, 567):
+            # B站风控拒绝：原样重试不会成功，连续请求反而可能加重限制，停止本批
+            return {"audio": None, "exception": e, "message": f"哔哩哔哩拒绝了音频请求（HTTP {status}），请稍后再试或联系管理员",
+                    "retryable": False, "stop_batch": True}
+        if status == 403:
+            # 单个 CDN 节点拒绝：重试会重新获取地址，可能分配到其他节点
+            return {"audio": None, "exception": e, "message": "哔哩哔哩音频节点拒绝了请求（HTTP 403）", "retryable": True}
         return {"audio": None, "exception": e, "message": "请求繁忙", "retryable": True}
     except aiohttp.ClientPayloadError as e:
         await console.rp(
@@ -1994,6 +2002,10 @@ async def play_netease(ctx: discord.ApplicationContext, link, response=None, max
 
     # 截取出yt-dlp可读取的部分（目前已知yt-dlp 2024.07.25不能读取包含/my/m/music/的链接）
     link = utils.get_legal_netease_url(link)
+    if link is None:
+        await embed_eos(ctx, response, author_name="暂不支持此网易云链接，请发送单曲或歌单链接", colour=orange, author_icon_url=icon.url(icon_error_filename), files=icon_lib.files(icon_error_filename), silent=True)
+        await console.rp("网易云链接中未找到单曲或歌单ID", ctx.guild, message_type=utils.PrintType.ERROR, print_head=True)
+        return
 
     # 先提取信息
     info_result = await get_ytdlp_info(ctx, link)

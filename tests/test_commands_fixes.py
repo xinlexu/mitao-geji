@@ -306,6 +306,29 @@ class CommandTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.env["media_error_stops_batch"](RuntimeError("private video")))
 
 
+class NetEaseLinkTests(unittest.IsolatedAsyncioTestCase):
+    async def test_unsupported_netease_link_is_answered_without_extraction(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("netease_links_test", SOURCE / "zeta_bot/url_safety.py")
+        url_safety = importlib.util.module_from_spec(spec); spec.loader.exec_module(url_safety)
+        replies, extracted = [], []
+        async def embed_eos(ctx, response, **kwargs): replies.append(kwargs.get("author_name"))
+        async def get_ytdlp_info(ctx, link): extracted.append(link); return {"info_dict": None, "message": "x", "retryable": False}
+        guild = NS(get_playlist=lambda: NS())
+        env = dict(discord=NS(ApplicationContext=object, Interaction=object, InteractionMessage=object),
+                   Union=__import__("typing").Union, guild_lib=NS(get_guild=lambda ctx: guild),
+                   utils=NS(get_legal_netease_url=url_safety.get_legal_netease_url, PrintType=NS(ERROR=1)),
+                   embed_eos=embed_eos, get_ytdlp_info=get_ytdlp_info, console=NS(rp=noop), orange=0,
+                   icon=NS(url=lambda name: name), icon_lib=NS(files=lambda name: []))
+        load_nodes("zeta_bot/core.py", {"play_netease"}, env)
+        ctx = NS(guild=NS(voice_client=None))
+        await env["play_netease"](ctx, "https://music.163.com/#/album?id=18905")
+        self.assertEqual(extracted, [])
+        self.assertTrue(replies and "网易云链接" in replies[-1])
+        await env["play_netease"](ctx, "https://y.music.163.com/m/song?app_version=9.1.65&id=186016&uct2=x")
+        self.assertEqual(extracted, ["https://music.163.com/#/song?id=186016"])
+
+
 class SettingTests(unittest.TestCase):
     def setUp(self):
         self.env = dict(re=re, errors=NS(UserCancelled=type("UserCancelled", (Exception,), {})), time=NS(sleep=lambda _: None))

@@ -86,6 +86,25 @@ class PersistenceAndLinks(unittest.TestCase):
                 self.assertIsNotNone(urls.get_url_from_str(value, expected))
         self.assertIsNone(urls.get_legal_netease_url('https://music.163.com/song?id=bad'))
 
+    def test_netease_share_links_keep_id_from_any_query_position(self):
+        cases = {
+            'https://music.163.com/#/song?id=186016': 'https://music.163.com/#/song?id=186016',
+            'https://music.163.com/song?id=186016&userid=1': 'https://music.163.com/#/song?id=186016',
+            'https://y.music.163.com/m/song?app_version=9.1.65&id=186016&uct2=x&dlt=0846': 'https://music.163.com/#/song?id=186016',
+            'https://y.music.163.com/m/playlist?app_version=9.1.65&id=3778678&userid=1&creatorId=2': 'https://music.163.com/#/playlist?id=3778678',
+            '分享单曲: https://y.music.163.com/m/song?id=186016&uct2=xx (来自@网易云音乐)': 'https://music.163.com/#/song?id=186016',
+        }
+        for value, expected in cases.items():
+            with self.subTest(value=value):
+                source = urls.check_url_source(value)
+                self.assertEqual(source, 'netease_url')
+                self.assertEqual(urls.get_legal_netease_url(urls.get_url_from_str(value, source)), expected)
+        for value in ['https://music.163.com/song?userid=5', 'https://music.163.com/#/album?id=18905',
+                      'https://music.163.com/#/artist?id=6452', 'https://music.163.com/song?id=12ab',
+                      'https://music.163.com/song?xid=5', None]:
+            with self.subTest(value=value):
+                self.assertIsNone(urls.get_legal_netease_url(value))
+
     def test_fake_hosts_userinfo_and_ports_are_rejected(self):
         for value in ['https://youtu.be@127.0.0.1:443/example',
                       'https://youtube.com.evil.invalid/x',

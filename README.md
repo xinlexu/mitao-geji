@@ -34,7 +34,7 @@
 
 ## 回归检查
 
-运行 `python tests/run_regression.py`，分别执行 13 组离线测试（227 项）。这些检查使用模拟的网络及播放 I/O，不登录 Discord、不下载歌曲，也不修改生产队列。
+运行 `python tests/run_regression.py`，分别执行 13 组离线测试（235 项）。这些检查使用模拟的网络及播放 I/O，不登录 Discord、不下载歌曲，也不修改生产队列。
 
 ## 更新日志
 

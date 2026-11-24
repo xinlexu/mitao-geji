@@ -85,6 +85,41 @@ class BilibiliWrapperTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["message"], "请求繁忙")
         self.assertTrue(result["retryable"])
 
+    async def test_node_403_is_retryable_and_reports_status(self):
+        self.failure = ClientResponseError("RAW_PRIVATE_ERROR_SENTINEL")
+        self.failure.status = 403
+        result = await self.call()
+        self.assertIsNone(result["audio"])
+        self.assertTrue(result["retryable"])
+        self.assertFalse(result.get("stop_batch", False))
+        self.assertIn("HTTP 403", result["message"])
+        self.assertNotIn("RAW_PRIVATE_ERROR_SENTINEL", result["message"] + "".join(self.logs))
+
+    async def test_cdn_rejection_stops_without_retry_and_reports_status(self):
+        for status in (412, 567):
+            with self.subTest(status=status):
+                self.failure = ClientResponseError("RAW_PRIVATE_ERROR_SENTINEL")
+                self.failure.status = status
+                result = await self.call()
+                self.assertIsNone(result["audio"])
+                self.assertFalse(result["retryable"])
+                self.assertTrue(result["stop_batch"])
+                self.assertIn(f"HTTP {status}", result["message"])
+                self.assertNotIn("RAW_PRIVATE_ERROR_SENTINEL", result["message"] + "".join(self.logs))
+
+    def test_cdn_download_uses_browser_headers(self):
+        tree = ast.parse((SOURCE / "zeta_bot/bilibili.py").read_text(encoding="utf-8-sig"))
+        node = next(n for n in tree.body if isinstance(n, ast.Assign) and getattr(n.targets[0], "id", "") == "DOWNLOAD_HEADERS")
+        headers = ast.literal_eval(node.value)
+        self.assertEqual(headers["Referer"], "https://www.bilibili.com/")
+        self.assertEqual(headers["Origin"], "https://www.bilibili.com")
+        self.assertEqual(headers["Range"], "bytes=0-")
+        self.assertIn("Chrome/", headers["User-Agent"])
+        source = (SOURCE / "zeta_bot/bilibili.py").read_text(encoding="utf-8-sig")
+        self.assertEqual(source.count("headers = dict(DOWNLOAD_HEADERS)"), 2)
+        self.assertEqual(source.count("_audio_url_candidates(") , 3)
+        self.assertNotIn('"User-Agent": "Mozilla/5.0",', source)
+
     async def test_cancellation_is_not_swallowed_as_network_failure(self):
         self.failure = asyncio.CancelledError()
         with self.assertRaises(asyncio.CancelledError):

@@ -61,8 +61,14 @@ def get_url_from_str(input_str, url_type):
 
 
 def get_legal_netease_url(input_str):
-    found = re.search(r"(?:song|playlist)\?id=\d+", str(input_str))
-    return "https://music.163.com/#/" + found.group(0) if found else None
+    """Normalize NetEase song/playlist links for yt-dlp.
+
+    App share links put other parameters first, for example
+    y.music.163.com/m/song?app_version=9.1.0&id=186016, so the id may be any
+    query parameter. Returns None for links that are not a song or playlist.
+    """
+    found = re.search(r"/(song|playlist)\?(?:[^#\s]*?&)?id=(\d+)(?!\w)", str(input_str))
+    return f"https://music.163.com/#/{found.group(1)}?id={found.group(2)}" if found else None
 
 
 async def get_redirect_url(url):
