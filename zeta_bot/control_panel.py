@@ -189,6 +189,12 @@ async def _update_locked(runtime, current_guild, state, ctx, create, restoring=F
         if restoring and state.registered_id != message_id:
             runtime.bot.add_view(view, message_id=message_id)
             state.registered_id = message_id
+        # The fetches above yield to the event loop. Meanwhile a late gateway
+        # MESSAGE_UPDATE from an earlier edit (pycord refreshes the tracked view
+        # from it) or a button handler can rewrite this shared view's buttons.
+        # Message.edit serializes the view synchronously, so render again here:
+        # the sent embed, buttons and remembered fingerprint then all match.
+        view, embed, fingerprint = await _render(runtime, current_guild, state)
         if state.saved_ids == ids and state.fingerprint == fingerprint:
             state.message = message
             return message

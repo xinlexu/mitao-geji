@@ -181,6 +181,49 @@ class ControlPanelTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(FakeView.created), 1)
         self.assertFalse(self.bot.added)
 
+    async def test_buttons_changed_during_fetch_are_rendered_again_before_edit(self):
+        # Reproduces a stuck "正在切歌" panel: the embed was rendered for the new song,
+        # then a late gateway update rewrote the shared view while the message was
+        # being fetched, and the stale buttons were sent with a fresh fingerprint.
+        class StatefulView(FakeView):
+            def __init__(self, runtime, guild):
+                super().__init__(runtime, guild)
+                self.buttons = "unset"
+            def refresh_state(self):
+                super().refresh_state()
+                self.buttons = self.guild.status
+            def to_components(self):
+                return [{"type": 1, "components": [{"type": 2, "custom_id": "persistent", "label": self.buttons}]}]
+        class SerializingMessage(Message):
+            async def edit(self, **kwargs):
+                # Like pycord, components are serialized when edit() starts.
+                kwargs["sent"] = (kwargs["embed"].to_dict()["description"],
+                                  kwargs["view"].to_components()[0]["components"][0]["label"])
+                return await super().edit(**kwargs)
+        previous = MANAGER.music_controls.PersistentMusicView
+        MANAGER.music_controls.PersistentMusicView = StatefulView
+        try:
+            message = SerializingMessage(self.channel, 50)
+            self.channel.messages[50] = message
+            self.guild.metadata = {"channel_id": self.channel.id, "message_id": 50}
+            self.guild.status = "playing old song"
+            await self.update()
+            fetch = self.channel.fetch_message
+            async def fetch_with_late_gateway_update(message_id):
+                result = await fetch(message_id)
+                FakeView.created[-1].buttons = "switching"
+                return result
+            self.channel.fetch_message = fetch_with_late_gateway_update
+            self.guild.status = "playing new song"
+            await self.update()
+            self.assertEqual(message.edits[-1]["sent"], ("playing new song", "playing new song"))
+            self.channel.fetch_message = fetch
+            edits = len(message.edits)
+            await self.update()
+            self.assertEqual(len(message.edits), edits)
+        finally:
+            MANAGER.music_controls.PersistentMusicView = previous
+
     async def test_refresh_without_metadata_never_sends(self):
         self.assertIsNone(await self.update(ctx=self.ctx))
         self.assertFalse(self.channel.sends)
